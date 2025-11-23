@@ -1,0 +1,241 @@
+Telegram M5 Signal Bot (Railway-compatible)
+
+Save this as: fx_m5_bot.py
+
+
+
+Environment variables to set in Railway (Project -> Variables):
+
+TELEGRAM_BOT_TOKEN - your bot token
+
+TELEGRAM_CHAT_ID - your Telegram chat id (integer)
+
+ALPHA_KEY - your Alpha Vantage API key
+
+SYMBOLS - optional comma-separated symbols (default: EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,XAUUSD,BTC/USDT)
+
+
+
+Requirements (requirements.txt):
+
+requests
+
+pandas
+
+numpy
+
+apscheduler
+
+python-telegram-bot==13.15
+
+ta
+
+ccxt
+
+import os import time import logging from datetime import datetime, timezone import requests import pandas as pd import numpy as np from apscheduler.schedulers.background import BackgroundScheduler from telegram import Bot import ccxt
+
+TA helpers from ta package
+
+from ta.trend import EMAIndicator from ta.momentum import RSIIndicator
+
+-----------------------------
+
+Configuration (from env vars)
+
+-----------------------------
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") ALPHA_KEY = os.getenv("ALPHA_KEY") SYMBOLS_ENV = os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,XAUUSD,BTC/USDT") TIMEFRAME = os.getenv("TIMEFRAME", "5min")  # for Alpha Vantage (5min) EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50")) RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14")) LIMIT = int(os.getenv("LIMIT", "200")) SEND_DUPLICATES = os.getenv("SEND_DUPLICATES", "false").lower() == "true"
+
+Validate critical env vars early
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not ALPHA_KEY: raise SystemExit("Missing one or more required environment variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPHA_KEY")
+
+TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID) SYMBOLS = [s.strip() for s in SYMBOLS_ENV.split(",") if s.strip()]
+
+-----------------------------
+
+Setup logging and bot
+
+-----------------------------
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s') logger = logging.getLogger("m5-signal-bot") bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+ccxt exchange for crypto data
+
+exchange = ccxt.binance({ 'enableRateLimit': True })
+
+store last signals to avoid duplicates
+
+last_signal = {}
+
+-----------------------------
+
+Utility: fetch FX / Gold from Alpha Vantage
+
+-----------------------------
+
+def fetch_fx_alpha(symbol): """Fetch intraday FX or XAUUSD from Alpha Vantage and return DataFrame with columns open, high, low, close.""" # symbol e.g. EURUSD or XAUUSD (Alpha expects XAU and USD separately) if symbol.upper() == 'XAUUSD': # Alpha uses function: DIGITAL_CURRENCY_INTRADAY is for crypto; metals use FX_INTRADAY with from_symbol XAU? We'll keep using FX_INTRADAY with from XAU & to USD base = 'XAU' quote = 'USD' else: base = symbol[:3] quote = symbol[3:]
+
+url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}&interval={TIMEFRAME}&outputsize=compact&apikey={ALPHA_KEY}"
+try:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+except Exception as e:
+    logger.warning(f"Alpha Vantage request failed for {symbol}: {e}")
+    return None
+
+# key name varies by interval - for 5min it'll be 'Time Series FX (5min)'
+key = f"Time Series FX ({TIMEFRAME})"
+if key not in data:
+    # fallback: try to find any "Time Series" key present
+    for k in data.keys():
+        if k.startswith('Time Series'):
+            key = k
+            break
+
+if key not in data:
+    logger.warning(f"Alpha Vantage returned unexpected payload for {symbol}: {list(data.keys())[:5]}")
+    return None
+
+raw = data[key]
+df = pd.DataFrame(raw).T
+df = df.rename(columns={
+    '1. open': 'open',
+    '2. high': 'high',
+    '3. low': 'low',
+    '4. close': 'close'
+})
+df.index = pd.to_datetime(df.index)
+df = df.sort_index()
+df = df.astype(float)
+return df.tail(LIMIT)
+
+-----------------------------
+
+Utility: fetch crypto via ccxt (Binance)
+
+-----------------------------
+
+def fetch_crypto_ccxt(symbol): """symbol like BTC/USDT - returns DataFrame with open, high, low, close indexed by UTC timestamp""" try: ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=LIMIT) except Exception as e: logger.warning(f"ccxt fetch failed for {symbol}: {e}") return None df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume']) df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True) df = df.set_index('ts') return df[['open','high','low','close','volume']].astype(float)
+
+-----------------------------
+
+Candlestick pattern helpers
+
+-----------------------------
+
+def is_bullish_engulfing(df): if len(df) < 2: return False prev = df.iloc[-2]  # previous candle cur = df.iloc[-1]   # last candle return (prev['close'] < prev['open']) and (cur['close'] > cur['open']) and (cur['close'] > prev['open']) and (cur['open'] < prev['close'])
+
+def is_bearish_engulfing(df): if len(df) < 2: return False prev = df.iloc[-2] cur = df.iloc[-1] return (prev['close'] > prev['open']) and (cur['close'] < cur['open']) and (cur['open'] > prev['close']) and (cur['close'] < prev['open'])
+
+def is_hammer(df): c = df.iloc[-1] body = abs(c['close'] - c['open']) lower_wick = min(c['open'], c['close']) - c['low'] upper_wick = c['high'] - max(c['open'], c['close']) return (lower_wick > body * 2.5) and (upper_wick < body * 0.5)
+
+def is_shooting_star(df): c = df.iloc[-1] body = abs(c['close'] - c['open']) upper_wick = c['high'] - max(c['open'], c['close']) lower_wick = min(c['open'], c['close']) - c['low'] return (upper_wick > body * 2.5) and (lower_wick < body * 0.5)
+
+-----------------------------
+
+Signal generation
+
+-----------------------------
+
+def calc_indicators(df): close = df['close'].astype(float) # EMA using ta package (wrap in try) try: ema_ind = EMAIndicator(close=close, window=EMA_PERIOD) ema = ema_ind.ema_indicator() except Exception: ema = close.rolling(window=EMA_PERIOD, min_periods=1).mean()
+
+try:
+    rsi_ind = RSIIndicator(close=close, window=RSI_PERIOD)
+    rsi = rsi_ind.rsi()
+except Exception:
+    # fallback simple RSI-like (not exact)
+    delta = close.diff()
+    up = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
+    down = -delta.clip(upper=0).rolling(RSI_PERIOD).mean()
+    rs = up / (down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+
+return ema, rsi
+
+def generate_signal_for_df(df, symbol): if df is None or len(df) < EMA_PERIOD + 2: return None
+
+ema, rsi = calc_indicators(df)
+last_close = float(df['close'].iloc[-1])
+last_ema = float(ema.iloc[-1])
+last_rsi = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else None
+
+trend = 'up' if last_close > last_ema else 'down'
+
+bull = is_bullish_engulfing(df) or is_hammer(df)
+bear = is_bearish_engulfing(df) or is_shooting_star(df)
+
+# BUY conditions: uptrend + bullish pattern + RSI not overbought
+if trend == 'up' and bull and (last_rsi is None or last_rsi < 65):
+    entry = float(df['high'].iloc[-1])
+    sl = float(df['low'].iloc[-1])
+    return {'side':'BUY', 'entry': entry, 'sl': sl, 'rsi': last_rsi, 'reason': 'EMA50 up + bullish candle'}
+
+# SELL conditions: downtrend + bearish pattern + RSI not oversold
+if trend == 'down' and bear and (last_rsi is None or last_rsi > 35):
+    entry = float(df['low'].iloc[-1])
+    sl = float(df['high'].iloc[-1])
+    return {'side':'SELL', 'entry': entry, 'sl': sl, 'rsi': last_rsi, 'reason': 'EMA50 down + bearish candle'}
+
+return None
+
+-----------------------------
+
+Fetch wrapper: decide by symbol format
+
+-----------------------------
+
+def fetch_symbol_ohlcv(symbol): # if symbol contains '/', treat as exchange/crypto pair (ccxt) if '/' in symbol: return fetch_crypto_ccxt(symbol) else: return fetch_fx_alpha(symbol)
+
+-----------------------------
+
+Message formatting and sending
+
+-----------------------------
+
+def format_signal_message(symbol, sig): now = datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z') txt = f"M5 SIGNAL — {symbol} Time: {now} Signal: {sig['side']} Reason: {sig.get('reason','')} Entry Trigger: {sig['entry']} Stop Loss: {sig['sl']} " if sig.get('rsi') is not None: txt += f"RSI: {sig['rsi']:.2f} " txt += "Filter: EMA50 + Candlestick confirmation | Timeframe: 5m" return txt
+
+def send_telegram(text): try: bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown') logger.info('Telegram message sent') except Exception as e: logger.exception(f'Failed to send telegram message: {e}')
+
+-----------------------------
+
+Main scheduled job
+
+-----------------------------
+
+def job_check_symbols(): logger.info('Running scan for symbols: ' + ','.join(SYMBOLS)) for symbol in SYMBOLS: try: df = fetch_symbol_ohlcv(symbol) if df is None: logger.info(f'No data for {symbol}, skipping') continue
+
+sig = generate_signal_for_df(df, symbol)
+        if sig:
+            prev = last_signal.get(symbol)
+            if (not SEND_DUPLICATES) and prev == sig['side']:
+                logger.info(f"Skipping duplicate {sig['side']} for {symbol}")
+                continue
+            msg = format_signal_message(symbol, sig)
+            send_telegram(msg)
+            last_signal[symbol] = sig['side']
+        else:
+            last_signal[symbol] = None
+    except Exception as e:
+        logger.exception(f"Error while processing {symbol}: {e}")
+
+-----------------------------
+
+Run the bot (scheduler)
+
+-----------------------------
+
+if name == 'main': logger.info('Starting M5 Signal Bot') # warmup run job_check_symbols()
+
+scheduler = BackgroundScheduler()
+# run every 5 minutes aligned to clock
+scheduler.add_job(job_check_symbols, 'cron', minute='*/5')
+scheduler.start()
+
+try:
+    while True:
+        time.sleep(10)
+except (KeyboardInterrupt, SystemExit):
+    scheduler.shutdown()
+    logger.info('Shutting down')
